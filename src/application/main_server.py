@@ -1,3 +1,5 @@
+import asyncio
+import os
 from textwrap import dedent
 from typing import TYPE_CHECKING
 
@@ -6,6 +8,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
+import httpx
 from uvicorn import Config, Server
 
 from ..custom import (
@@ -145,6 +148,57 @@ class APIServer(TikTok):
         elif t == _("视频"):
             files.append(actual_root.with_name(f"{name}.mp4"))
         return files
+
+    @staticmethod
+    def _sanitize_hook_params(params: dict) -> dict:
+        """避免把敏感字段（如 cookie）通过 webhook 外发。"""
+        if not isinstance(params, dict):
+            return {}
+        cleaned = dict(params)
+        for k in ("cookie", "cookie_tiktok", "headers", "authorization", "token"):
+            cleaned.pop(k, None)
+        return cleaned
+
+    @staticmethod
+    def _get_post_download_hook_urls() -> list[str]:
+        """
+        下载完成后的 webhook 通知地址，使用 ; 分隔多个。
+        环境变量：POST_DOWNLOAD_WEBHOOK_URL
+        """
+        raw = (os.getenv("POST_DOWNLOAD_WEBHOOK_URL") or "").strip()
+        if not raw:
+            return []
+        return [u.strip() for u in raw.split(";") if u.strip()]
+
+    def _trigger_post_download_hook(self, payload: dict) -> None:
+        """异步触发下载完成钩子；失败不影响主流程。"""
+        if not self._get_post_download_hook_urls():
+            return
+        try:
+            asyncio.create_task(self._send_post_download_webhook(payload))
+        except RuntimeError:
+            # 没有运行中的 event loop（极少见），直接忽略
+            return
+
+    async def _send_post_download_webhook(self, payload: dict) -> None:
+        urls = self._get_post_download_hook_urls()
+        if not urls:
+            return
+
+        token = (os.getenv("POST_DOWNLOAD_WEBHOOK_TOKEN") or "").strip()
+        timeout_s = float(os.getenv("POST_DOWNLOAD_WEBHOOK_TIMEOUT", "2.0") or "2.0")
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            for url in urls:
+                try:
+                    resp = await client.post(url, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    self.logger.info(f"已通知下载后钩子: {url}")
+                except Exception as e:
+                    self.logger.error(f"下载后钩子通知失败: {url} -> {e}")
 
     def setup_routes(self):
         @self.server.get(
@@ -336,14 +390,26 @@ class APIServer(TikTok):
                             }
                         )
 
+            data_payload = {
+                "resolved_url": resolved,
+                "mount": "/files",
+                "root": str(self.parameter.root.resolve()),
+                "items": items_out,
+            }
+            self._trigger_post_download_hook(
+                {
+                    "event": "download.completed",
+                    "platform": "douyin",
+                    "source": "share",
+                    "resolved_url": resolved,
+                    "root": data_payload["root"],
+                    "items": items_out,
+                    "params": self._sanitize_hook_params(extract.model_dump()),
+                }
+            )
             return DataResponse(
                 message=_("下载任务已完成！"),
-                data={
-                    "resolved_url": resolved,
-                    "mount": "/files",
-                    "root": str(self.parameter.root.resolve()),
-                    "items": items_out,
-                },
+                data=data_payload,
                 params=extract.model_dump(),
             )
 
@@ -468,16 +534,30 @@ class APIServer(TikTok):
                     }
                 )
 
+            data_payload = {
+                "resolved_url": resolved,
+                "mount": "/files",
+                "root": str(self.parameter.root.resolve()),
+                "earliest": str(earliest),
+                "latest": str(latest),
+                "items": items_out,
+            }
+            self._trigger_post_download_hook(
+                {
+                    "event": "download.completed",
+                    "platform": "douyin",
+                    "source": "favorite",
+                    "resolved_url": resolved,
+                    "root": data_payload["root"],
+                    "earliest": data_payload["earliest"],
+                    "latest": data_payload["latest"],
+                    "items": items_out,
+                    "params": self._sanitize_hook_params(extract.model_dump()),
+                }
+            )
             return DataResponse(
                 message=_("下载任务已完成！"),
-                data={
-                    "resolved_url": resolved,
-                    "mount": "/files",
-                    "root": str(self.parameter.root.resolve()),
-                    "earliest": str(earliest),
-                    "latest": str(latest),
-                    "items": items_out,
-                },
+                data=data_payload,
                 params=extract.model_dump(),
             )
 
@@ -926,14 +1006,26 @@ class APIServer(TikTok):
                             }
                         )
 
+            data_payload = {
+                "resolved_url": resolved,
+                "mount": "/files",
+                "root": str(self.parameter.root.resolve()),
+                "items": items_out,
+            }
+            self._trigger_post_download_hook(
+                {
+                    "event": "download.completed",
+                    "platform": "tiktok",
+                    "source": "share",
+                    "resolved_url": resolved,
+                    "root": data_payload["root"],
+                    "items": items_out,
+                    "params": self._sanitize_hook_params(extract.model_dump()),
+                }
+            )
             return DataResponse(
                 message=_("下载任务已完成！"),
-                data={
-                    "resolved_url": resolved,
-                    "mount": "/files",
-                    "root": str(self.parameter.root.resolve()),
-                    "items": items_out,
-                },
+                data=data_payload,
                 params=extract.model_dump(),
             )
 
@@ -1056,16 +1148,30 @@ class APIServer(TikTok):
                     }
                 )
 
+            data_payload = {
+                "resolved_url": resolved,
+                "mount": "/files",
+                "root": str(self.parameter.root.resolve()),
+                "earliest": str(earliest),
+                "latest": str(latest),
+                "items": items_out,
+            }
+            self._trigger_post_download_hook(
+                {
+                    "event": "download.completed",
+                    "platform": "tiktok",
+                    "source": "favorite",
+                    "resolved_url": resolved,
+                    "root": data_payload["root"],
+                    "earliest": data_payload["earliest"],
+                    "latest": data_payload["latest"],
+                    "items": items_out,
+                    "params": self._sanitize_hook_params(extract.model_dump()),
+                }
+            )
             return DataResponse(
                 message=_("下载任务已完成！"),
-                data={
-                    "resolved_url": resolved,
-                    "mount": "/files",
-                    "root": str(self.parameter.root.resolve()),
-                    "earliest": str(earliest),
-                    "latest": str(latest),
-                    "items": items_out,
-                },
+                data=data_payload,
                 params=extract.model_dump(),
             )
 
