@@ -68,7 +68,8 @@ class Info(API):
     ) -> dict:
         if isinstance(self.sec_user_id, str):
             self.sec_user_id = [self.sec_user_id]
-        value = f"[{','.join(f'"{i}"' for i in self.sec_user_id)}]"
+        # 构造形如 ["id1","id2"] 的字符串参数；避免在 f-string 表达式中嵌套 f-string 导致解析问题
+        value = "[" + ",".join(f"\"{i}\"" for i in self.sec_user_id) + "]"
         return {
             "sec_user_ids": value,
         }

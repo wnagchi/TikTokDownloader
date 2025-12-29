@@ -1,8 +1,11 @@
 from textwrap import dedent
 from typing import TYPE_CHECKING
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from uvicorn import Config, Server
 
 from ..custom import (
@@ -29,6 +32,10 @@ from ..models import (
     Reply,
     Settings,
     ShortUrl,
+    DownloadFromShare,
+    DownloadFromShareTikTok,
+    DownloadFavorite,
+    DownloadFavoriteTikTok,
     UrlResponse,
     UserSearch,
     VideoSearch,
@@ -91,6 +98,13 @@ class APIServer(TikTok):
             version=__VERSION__,
         )
         self.setup_routes()
+        # 让下载后的文件可通过 HTTP 访问：/files/<relative_path>
+        # 挂载目录为 parameter.root（默认是项目 Volume 目录）
+        self.server.mount(
+            "/files",
+            StaticFiles(directory=str(self.parameter.root), check_dir=False),
+            name="files",
+        )
         config = Config(
             self.server,
             host=host,
@@ -99,6 +113,38 @@ class APIServer(TikTok):
         )
         server = Server(config)
         await server.serve()
+
+    def _path_to_file_url(self, request: Request, path: Path) -> str | None:
+        """把本地路径转换成 /files 可访问 URL（仅允许 parameter.root 目录内的文件）。"""
+        try:
+            rel = path.resolve().relative_to(self.parameter.root.resolve())
+        except Exception:
+            return None
+        # request.base_url 末尾带 /
+        return f"{request.base_url}files/{rel.as_posix()}"
+
+    def _predict_download_files(self, item: dict, root: Path) -> list[Path]:
+        """基于 downloader 的命名规则，预测该作品下载后的文件路径列表。"""
+        name = self.downloader.generate_detail_name(item)
+        temp_root, actual_root = self.downloader.deal_folder_path(
+            root,
+            name,
+            self.downloader.folder_mode,
+        )
+        files: list[Path] = []
+        t = item.get("type")
+        downloads = item.get("downloads") or []
+        if t == _("图集"):
+            files.extend(
+                actual_root.with_name(f"{name}_{i}.jpeg") for i in range(1, len(downloads) + 1)
+            )
+        elif t == _("实况"):
+            files.extend(
+                actual_root.with_name(f"{name}_{i}.mp4") for i in range(1, len(downloads) + 1)
+            )
+        elif t == _("视频"):
+            files.append(actual_root.with_name(f"{name}.mp4"))
+        return files
 
     def setup_routes(self):
         @self.server.get(
@@ -187,6 +233,251 @@ class APIServer(TikTok):
             return UrlResponse(
                 message=_("请求链接失败！"),
                 url=None,
+                params=extract.model_dump(),
+            )
+
+        @self.server.post(
+            "/douyin/download/share",
+            summary=_("从分享链接解析并下载作品/图集/合集"),
+            description=_(
+                dedent("""
+                传入“分享文案/分享链接”，接口将自动判断是单作品还是合集，并执行下载。
+
+                下载完成后返回可访问的文件 URL（需要保持 API 服务运行）。
+                """)
+            ),
+            tags=[_("抖音")],
+            response_model=DataResponse,
+        )
+        async def handle_download_share(
+            extract: DownloadFromShare,
+            request: Request,
+            token: str = Depends(token_dependency),
+        ):
+            resolved = await self.handle_redirect(extract.text, extract.proxy)
+
+            # 先尝试按“合集/作品二选一”解析
+            mix_flag, ids = await self.links.run(extract.text, "mix", extract.proxy)  # type: ignore[misc]
+            if not ids:
+                # 再尝试单作品
+                ids = await self.links.run(extract.text, "detail", extract.proxy)  # type: ignore[assignment]
+                mix_flag = False
+
+            if not ids:
+                return DataResponse(
+                    message=_("解析分享链接失败！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            # 执行下载（先走 api=True 拿到抽取后的结构化数据，再调用 downloader 落盘）
+            items_out = []
+            if mix_flag:
+                for mix_id in ids:
+                    data = await self.deal_mix_detail(
+                        True,
+                        mix_id,
+                        api=True,
+                        source=False,
+                        cookie=extract.cookie,
+                        proxy=extract.proxy,
+                        cursor=extract.cursor,
+                        count=extract.count,
+                    )
+                    if not data:
+                        continue
+                    mix_title = (data[0] or {}).get("mix_title", "")
+                    root = self.downloader.storage_folder("mix", mix_id, extract.mark or mix_title)
+                    await self.downloader.run_batch(
+                        data,
+                        False,
+                        mode="mix",
+                        mark=extract.mark,
+                        mix_id=mix_id,
+                        mix_title=mix_title,
+                    )
+                    for item in data:
+                        files = self._predict_download_files(item, root)
+                        items_out.append(
+                            {
+                                "id": item.get("id"),
+                                "type": item.get("type"),
+                                "files": [
+                                    {"path": str(p.resolve()), "url": self._path_to_file_url(request, p)}
+                                    for p in files
+                                ],
+                            }
+                        )
+            else:
+                root, params, logger = self.record.run(self.parameter)
+                async with logger(root, console=self.console, **params) as record:
+                    data = await self._handle_detail(
+                        ids,
+                        False,
+                        record,
+                        api=True,
+                        source=False,
+                        cookie=extract.cookie,
+                        proxy=extract.proxy,
+                    )
+                if data:
+                    root = self.downloader.storage_folder("detail")
+                    await self.downloader.run_general(data, False)
+                    for item in data:
+                        files = self._predict_download_files(item, root)
+                        items_out.append(
+                            {
+                                "id": item.get("id"),
+                                "type": item.get("type"),
+                                "files": [
+                                    {"path": str(p.resolve()), "url": self._path_to_file_url(request, p)}
+                                    for p in files
+                                ],
+                            }
+                        )
+
+            return DataResponse(
+                message=_("下载任务已完成！"),
+                data={
+                    "resolved_url": resolved,
+                    "mount": "/files",
+                    "root": str(self.parameter.root.resolve()),
+                    "items": items_out,
+                },
+                params=extract.model_dump(),
+            )
+
+        @self.server.post(
+            "/douyin/download/favorite",
+            summary=_("下载账号喜欢作品(抖音)"),
+            description=_(
+                dedent("""
+                下载指定账号的“喜欢”列表作品，并返回可访问文件 URL。
+                
+                - 传 sec_user_id：直接下载该账号喜欢列表
+                - 或传 text：账号主页/分享链接（服务端会自动提取 sec_user_id）
+                """)
+            ),
+            tags=[_("抖音")],
+            response_model=DataResponse,
+        )
+        async def handle_download_favorite(
+            extract: DownloadFavorite,
+            request: Request,
+            token: str = Depends(token_dependency),
+        ):
+            sec_user_id = extract.sec_user_id
+            resolved = ""
+            if not sec_user_id:
+                # 1) 允许用账号主页/分享链接自动提取
+                if extract.text:
+                    resolved = await self.handle_redirect(extract.text, extract.proxy)
+                    ids = await self.links.run(extract.text, "user", extract.proxy)  # type: ignore[misc]
+                    sec_user_id = ids[0] if ids else ""
+                # 2) 不传 text / sec_user_id 时，默认使用 settings.json 的 owner_url（视为“当前账号”）
+                if not sec_user_id:
+                    owner = (self.parameter.settings.read() or {}).get("owner_url") or {}
+                    sec_user_id = owner.get("sec_uid") or owner.get("sec_user_id") or ""
+                    if not sec_user_id and owner.get("url"):
+                        ids = await self.links.run(owner["url"], "user", extract.proxy)  # type: ignore[misc]
+                        sec_user_id = ids[0] if ids else ""
+
+            if not sec_user_id:
+                return DataResponse(
+                    message=_(
+                        "参数错误：缺少 sec_user_id！请传 sec_user_id 或 text；"
+                        "或在 settings.json 设置 owner_url.url / owner_url.sec_uid 作为默认账号。"
+                    ),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            info = await self.get_user_info_data(
+                False,
+                extract.cookie,
+                extract.proxy,
+                sec_user_id=sec_user_id,
+            )
+            if not info:
+                return DataResponse(
+                    message=_("获取账号信息失败，请检查 Cookie 登录状态！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            account_data, earliest, latest = await self._get_account_data(
+                cookie=extract.cookie,
+                proxy=extract.proxy,
+                sec_user_id=sec_user_id,
+                tab="favorite",
+                earliest=extract.earliest,
+                latest=extract.latest,
+                pages=extract.pages,
+                cursor=extract.cursor,
+                count=extract.count,
+            )
+            if not any(account_data):
+                return DataResponse(
+                    message=_("获取喜欢作品数据失败！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            # 抽取结构化数据
+            data = await self._batch_process_detail(
+                account_data,
+                api=True,
+                tiktok=False,
+                info=info,
+                mode="favorite",
+                mark=extract.mark,
+                user_id=sec_user_id,
+                earliest=earliest,
+                latest=latest,
+            )
+            if not data:
+                return DataResponse(
+                    message=_("提取作品数据失败！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            # 执行下载
+            folder_name = extract.mark or info.get("nickname", "")
+            root = self.downloader.storage_folder("favorite", sec_user_id, folder_name)
+            await self.downloader.run_batch(
+                data,
+                False,
+                mode="favorite",
+                mark=extract.mark,
+                user_id=sec_user_id,
+                user_name=info.get("nickname", ""),
+            )
+
+            items_out = []
+            for item in data:
+                files = self._predict_download_files(item, root)
+                items_out.append(
+                    {
+                        "id": item.get("id"),
+                        "type": item.get("type"),
+                        "files": [
+                            {"path": str(p.resolve()), "url": self._path_to_file_url(request, p)}
+                            for p in files
+                        ],
+                    }
+                )
+
+            return DataResponse(
+                message=_("下载任务已完成！"),
+                data={
+                    "resolved_url": resolved,
+                    "mount": "/files",
+                    "root": str(self.parameter.root.resolve()),
+                    "earliest": str(earliest),
+                    "latest": str(latest),
+                    "items": items_out,
+                },
                 params=extract.model_dump(),
             )
 
@@ -532,6 +823,249 @@ class APIServer(TikTok):
             return UrlResponse(
                 message=_("请求链接失败！"),
                 url=None,
+                params=extract.model_dump(),
+            )
+
+        @self.server.post(
+            "/tiktok/download/share",
+            summary=_("从分享链接解析并下载作品/图集/合辑"),
+            description=_(
+                dedent("""
+                传入“分享文案/分享链接”，接口将自动判断是单作品还是合辑，并执行下载。
+
+                下载完成后返回可访问的文件 URL（需要保持 API 服务运行）。
+                """)
+            ),
+            tags=["TikTok"],
+            response_model=DataResponse,
+        )
+        async def handle_download_share_tiktok(
+            extract: DownloadFromShareTikTok,
+            request: Request,
+            token: str = Depends(token_dependency),
+        ):
+            resolved = await self.handle_redirect_tiktok(extract.text, extract.proxy)
+
+            mix_flag, ids, titles = await self.links_tiktok.run(extract.text, "mix", extract.proxy)  # type: ignore[misc]
+            if not ids:
+                ids = await self.links_tiktok.run(extract.text, "detail", extract.proxy)  # type: ignore[assignment]
+                mix_flag = False
+                titles = []
+
+            if not ids:
+                return DataResponse(
+                    message=_("解析分享链接失败！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            items_out = []
+            if mix_flag:
+                for idx, mix_id in enumerate(ids):
+                    mix_title = titles[idx] if idx < len(titles) else ""
+                    data = await self.deal_mix_detail(
+                        True,
+                        mix_id,
+                        api=True,
+                        source=False,
+                        cookie=extract.cookie,
+                        proxy=extract.proxy,
+                        tiktok=True,
+                        cursor=extract.cursor,
+                        count=extract.count,
+                        mix_title=mix_title,
+                    )
+                    if not data:
+                        continue
+                    root = self.downloader.storage_folder("mix", mix_id, extract.mark or mix_title)
+                    await self.downloader.run_batch(
+                        data,
+                        True,
+                        mode="mix",
+                        mark=extract.mark,
+                        mix_id=mix_id,
+                        mix_title=mix_title,
+                    )
+                    for item in data:
+                        files = self._predict_download_files(item, root)
+                        items_out.append(
+                            {
+                                "id": item.get("id"),
+                                "type": item.get("type"),
+                                "files": [
+                                    {"path": str(p.resolve()), "url": self._path_to_file_url(request, p)}
+                                    for p in files
+                                ],
+                            }
+                        )
+            else:
+                root, params, logger = self.record.run(self.parameter)
+                async with logger(root, console=self.console, **params) as record:
+                    data = await self._handle_detail(
+                        ids,
+                        True,
+                        record,
+                        api=True,
+                        source=False,
+                        cookie=extract.cookie,
+                        proxy=extract.proxy,
+                    )
+                if data:
+                    root = self.downloader.storage_folder("detail")
+                    await self.downloader.run_general(data, True)
+                    for item in data:
+                        files = self._predict_download_files(item, root)
+                        items_out.append(
+                            {
+                                "id": item.get("id"),
+                                "type": item.get("type"),
+                                "files": [
+                                    {"path": str(p.resolve()), "url": self._path_to_file_url(request, p)}
+                                    for p in files
+                                ],
+                            }
+                        )
+
+            return DataResponse(
+                message=_("下载任务已完成！"),
+                data={
+                    "resolved_url": resolved,
+                    "mount": "/files",
+                    "root": str(self.parameter.root.resolve()),
+                    "items": items_out,
+                },
+                params=extract.model_dump(),
+            )
+
+        @self.server.post(
+            "/tiktok/download/favorite",
+            summary=_("下载账号喜欢作品(TikTok)"),
+            description=_(
+                dedent("""
+                下载指定账号的“喜欢”列表作品，并返回可访问文件 URL。
+                
+                - 传 sec_user_id：直接下载该账号喜欢列表
+                - 或传 text：账号主页/分享链接（服务端会自动提取 sec_user_id）
+                """)
+            ),
+            tags=["TikTok"],
+            response_model=DataResponse,
+        )
+        async def handle_download_favorite_tiktok(
+            extract: DownloadFavoriteTikTok,
+            request: Request,
+            token: str = Depends(token_dependency),
+        ):
+            sec_user_id = extract.sec_user_id
+            resolved = ""
+            if not sec_user_id:
+                # 1) 允许用账号主页/分享链接自动提取
+                if extract.text:
+                    resolved = await self.handle_redirect_tiktok(extract.text, extract.proxy)
+                    ids = await self.links_tiktok.run(extract.text, "user", extract.proxy)  # type: ignore[misc]
+                    sec_user_id = ids[0] if ids else ""
+                # 2) 不传 text / sec_user_id 时，默认使用 settings.json 的 owner_url_tiktok（视为“当前账号”）
+                if not sec_user_id:
+                    owner = (self.parameter.settings.read() or {}).get("owner_url_tiktok") or {}
+                    sec_user_id = owner.get("sec_uid") or owner.get("secUid") or owner.get("sec_user_id") or ""
+                    if not sec_user_id and owner.get("url"):
+                        ids = await self.links_tiktok.run(owner["url"], "user", extract.proxy)  # type: ignore[misc]
+                        sec_user_id = ids[0] if ids else ""
+
+            if not sec_user_id:
+                return DataResponse(
+                    message=_(
+                        "参数错误：缺少 sec_user_id！请传 sec_user_id 或 text；"
+                        "或在 settings.json 设置 owner_url_tiktok.url / owner_url_tiktok.sec_uid 作为默认账号。"
+                    ),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            info = await self.get_user_info_data(
+                True,
+                extract.cookie,
+                extract.proxy,
+                sec_user_id=sec_user_id,
+            )
+            if not info:
+                return DataResponse(
+                    message=_("获取账号信息失败，请检查 Cookie 登录状态！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            account_data, earliest, latest = await self._get_account_data_tiktok(
+                cookie=extract.cookie,
+                proxy=extract.proxy,
+                sec_user_id=sec_user_id,
+                tab="favorite",
+                earliest=extract.earliest,
+                latest=extract.latest,
+                pages=extract.pages,
+                cursor=extract.cursor,
+                count=extract.count,
+            )
+            if not any(account_data):
+                return DataResponse(
+                    message=_("获取喜欢作品数据失败！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            data = await self._batch_process_detail(
+                account_data,
+                api=True,
+                tiktok=True,
+                info=info,
+                mode="favorite",
+                mark=extract.mark,
+                user_id=sec_user_id,
+                earliest=earliest,
+                latest=latest,
+            )
+            if not data:
+                return DataResponse(
+                    message=_("提取作品数据失败！"),
+                    data={"resolved_url": resolved, "items": []},
+                    params=extract.model_dump(),
+                )
+
+            folder_name = extract.mark or info.get("nickname", "")
+            root = self.downloader.storage_folder("favorite", sec_user_id, folder_name)
+            await self.downloader.run_batch(
+                data,
+                True,
+                mode="favorite",
+                mark=extract.mark,
+                user_id=sec_user_id,
+                user_name=info.get("nickname", ""),
+            )
+
+            items_out = []
+            for item in data:
+                files = self._predict_download_files(item, root)
+                items_out.append(
+                    {
+                        "id": item.get("id"),
+                        "type": item.get("type"),
+                        "files": [
+                            {"path": str(p.resolve()), "url": self._path_to_file_url(request, p)}
+                            for p in files
+                        ],
+                    }
+                )
+
+            return DataResponse(
+                message=_("下载任务已完成！"),
+                data={
+                    "resolved_url": resolved,
+                    "mount": "/files",
+                    "root": str(self.parameter.root.resolve()),
+                    "earliest": str(earliest),
+                    "latest": str(latest),
+                    "items": items_out,
+                },
                 params=extract.model_dump(),
             )
 

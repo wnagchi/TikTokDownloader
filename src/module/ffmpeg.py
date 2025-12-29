@@ -41,9 +41,10 @@ class FFMPEG:
 
     @staticmethod
     def generate_command_darwin(command: list) -> None:
+        escaped = " ".join(command).replace('"', '\\"')
         script = dedent(f"""
                 tell application "Terminal"
-                    do script "{" ".join(command).replace('"', '\\"')}"
+                    do script "{escaped}"
                     activate
                 end tell
                 """)
@@ -147,4 +148,5 @@ class FFMPEG:
 
     @staticmethod
     def __check_system_ffmpeg(path: Path = None):
-        return which(path or "ffmpeg")
+        # shutil.which 期望 str；Windows 下传 Path 会触发内部 lower() 报错
+        return which(str(path)) if path else which("ffmpeg")
