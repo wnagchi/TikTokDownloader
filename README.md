@@ -20,7 +20,10 @@
 <p>⭐ 本项目历史名称：<code>TikTokDownloader</code></p>
 <p>📣 本项目将于未来进行代码结构重构，目标是让代码更加稳健，并具备更好的可维护性与扩展性；如果你对项目设计、实现方式或优化思路有想法，欢迎提出建议或参与讨论！</p>
 <hr>
-
+# 钩子配置
+$env:POST_DOWNLOAD_WEBHOOK_URL="http://127.0.0.1:3000/api/reindex"
+$env:POST_DOWNLOAD_WEBHOOK_TIMEOUT="2"
+.\.venv\Scripts\python.exe .\main.py
 # 📝 项目功能
 
 <details>
