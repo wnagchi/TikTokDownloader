@@ -18,6 +18,8 @@ from .download import (
     DownloadFromShareTikTok,
     DownloadFavorite,
     DownloadFavoriteTikTok,
+    DownloadAccount,
+    DownloadAccountTikTok,
 )
 
 __all__ = (
@@ -43,4 +45,6 @@ __all__ = (
     "DownloadFromShareTikTok",
     "DownloadFavorite",
     "DownloadFavoriteTikTok",
+    "DownloadAccount",
+    "DownloadAccountTikTok",
 )

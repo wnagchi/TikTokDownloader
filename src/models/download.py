@@ -43,3 +43,24 @@ class DownloadFavorite(APIModel):
 class DownloadFavoriteTikTok(DownloadFavorite):
     count: int = Field(16, gt=0)
 
+
+class DownloadAccount(APIModel):
+    """
+    下载账号“发布作品”（抖音）。
+
+    - 优先使用 sec_user_id；如果不传，可以传 text（账号主页/分享链接）让服务端自动提取 sec_user_id
+    """
+
+    sec_user_id: str = ""
+    text: str = ""
+    mark: str = ""
+    earliest: str | float | int = ""
+    latest: str | float | int = ""
+    pages: int | None = None
+    cursor: int = 0
+    count: int = Field(18, gt=0)
+
+
+class DownloadAccountTikTok(DownloadAccount):
+    count: int = Field(16, gt=0)
+
