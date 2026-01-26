@@ -174,15 +174,35 @@ class APIServer(TikTok):
 
     def _trigger_post_download_hook(self, payload: dict) -> None:
         """异步触发下载完成钩子；失败不影响主流程。"""
-        if not self._get_post_download_hook_urls():
+        hook_urls = self._get_post_download_hook_urls()
+
+        # 记录 hook 触发信息（不管是否配置了 URL）
+        items_count = len(payload.get("items", []))
+        files_count = sum(len(item.get("files", [])) for item in payload.get("items", []))
+        self.logger.info(
+            f"[Hook] 下载完成事件触发 | "
+            f"平台: {payload.get('platform')} | "
+            f"来源: {payload.get('source')} | "
+            f"作品数: {items_count} | "
+            f"文件数: {files_count}"
+        )
+
+        if not hook_urls:
+            self.logger.info("[Hook] 未配置 POST_DOWNLOAD_WEBHOOK_URL，跳过 webhook 通知")
             return
+
+        self.logger.info(f"[Hook] 准备发送 webhook 通知到 {len(hook_urls)} 个地址")
         try:
             asyncio.create_task(self._send_post_download_webhook(payload))
         except RuntimeError:
             # 没有运行中的 event loop（极少见），直接忽略
+            self.logger.warning("[Hook] 无法创建异步任务：没有运行中的 event loop")
             return
 
     async def _send_post_download_webhook(self, payload: dict) -> None:
+        import json
+        import time
+
         urls = self._get_post_download_hook_urls()
         if not urls:
             return
@@ -192,15 +212,65 @@ class APIServer(TikTok):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
+            self.logger.info(f"[Hook] 使用 Bearer Token 认证")
+
+        # 计算 payload 大小
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        payload_size_kb = len(payload_json.encode('utf-8')) / 1024
+        self.logger.info(f"[Hook] Webhook 请求体大小: {payload_size_kb:.2f} KB")
 
         async with httpx.AsyncClient(timeout=timeout_s) as client:
-            for url in urls:
+            for idx, url in enumerate(urls, 1):
+                start_time = time.time()
                 try:
+                    self.logger.info(f"[Hook] [{idx}/{len(urls)}] 发送 webhook 到: {url}")
                     resp = await client.post(url, json=payload, headers=headers)
+                    elapsed_ms = (time.time() - start_time) * 1000
+
                     resp.raise_for_status()
-                    self.logger.info(f"已通知下载后钩子: {url}")
+                    self.logger.info(
+                        f"[Hook] [{idx}/{len(urls)}] ✓ 通知成功 | "
+                        f"状态码: {resp.status_code} | "
+                        f"耗时: {elapsed_ms:.0f}ms | "
+                        f"响应大小: {len(resp.content)} bytes | "
+                        f"URL: {url}"
+                    )
+
+                    # 记录响应内容（如果有）
+                    if resp.content:
+                        try:
+                            resp_data = resp.json()
+                            self.logger.debug(f"[Hook] [{idx}/{len(urls)}] 响应内容: {resp_data}")
+                        except:
+                            resp_text = resp.text[:200]  # 只记录前 200 字符
+                            self.logger.debug(f"[Hook] [{idx}/{len(urls)}] 响应文本: {resp_text}")
+
+                except httpx.TimeoutException as e:
+                    elapsed_ms = (time.time() - start_time) * 1000
+                    self.logger.error(
+                        f"[Hook] [{idx}/{len(urls)}] ✗ 请求超时 | "
+                        f"超时设置: {timeout_s}s | "
+                        f"已耗时: {elapsed_ms:.0f}ms | "
+                        f"URL: {url}"
+                    )
+                except httpx.HTTPStatusError as e:
+                    elapsed_ms = (time.time() - start_time) * 1000
+                    self.logger.error(
+                        f"[Hook] [{idx}/{len(urls)}] ✗ HTTP 错误 | "
+                        f"状态码: {e.response.status_code} | "
+                        f"耗时: {elapsed_ms:.0f}ms | "
+                        f"URL: {url} | "
+                        f"错误: {e}"
+                    )
                 except Exception as e:
-                    self.logger.error(f"下载后钩子通知失败: {url} -> {e}")
+                    elapsed_ms = (time.time() - start_time) * 1000
+                    self.logger.error(
+                        f"[Hook] [{idx}/{len(urls)}] ✗ 通知失败 | "
+                        f"耗时: {elapsed_ms:.0f}ms | "
+                        f"URL: {url} | "
+                        f"错误类型: {type(e).__name__} | "
+                        f"错误: {e}"
+                    )
 
     def setup_routes(self):
         @self.server.get(
