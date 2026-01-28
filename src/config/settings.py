@@ -61,6 +61,7 @@ class Settings:
             "nickname": "",
         },
         "owner_url_tiktok": None,
+        "account_subscriptions": [],
         "root": "",
         "folder_name": "Download",
         "name_format": "create_time type nickname desc",

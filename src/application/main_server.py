@@ -1,5 +1,7 @@
 import asyncio
 import os
+from contextlib import suppress
+from datetime import datetime, timedelta
 from textwrap import dedent
 from typing import TYPE_CHECKING
 
@@ -64,6 +66,9 @@ def token_dependency(token: str = Header(None)):
 
 
 class APIServer(TikTok):
+    SUBSCRIPTION_POLL_SECONDS = 60 * 30
+    DEFAULT_SUBSCRIPTION_INTERVAL_DAYS = 7
+
     def __init__(
         self,
         parameter: "Parameter",
@@ -76,6 +81,9 @@ class APIServer(TikTok):
             server_mode,
         )
         self.server = None
+        self._subscription_task = None
+        self._subscription_stop = None
+        self._subscription_lock = None
 
     async def handle_redirect(self, text: str, proxy: str = None) -> str:
         return await self.links.run(
@@ -103,6 +111,7 @@ class APIServer(TikTok):
             version=__VERSION__,
         )
         self.setup_routes()
+        self._setup_background_tasks()
         # 让下载后的文件可通过 HTTP 访问：/files/<relative_path>
         # 挂载目录为 parameter.root（默认是项目 Volume 目录）
         self.server.mount(
@@ -160,6 +169,286 @@ class APIServer(TikTok):
         for k in ("cookie", "cookie_tiktok", "headers", "authorization", "token"):
             cleaned.pop(k, None)
         return cleaned
+
+    def _setup_background_tasks(self):
+        @self.server.on_event("startup")
+        async def _startup():
+            if self._subscription_lock is None:
+                self._subscription_lock = asyncio.Lock()
+            if self._subscription_stop is None:
+                self._subscription_stop = asyncio.Event()
+            self._subscription_task = asyncio.create_task(self._subscription_loop())
+
+        @self.server.on_event("shutdown")
+        async def _shutdown():
+            if self._subscription_stop:
+                self._subscription_stop.set()
+            if self._subscription_task:
+                self._subscription_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._subscription_task
+
+    @staticmethod
+    def _subscription_key(item: dict, fallback: str = "") -> str:
+        return (
+            (item.get("sec_user_id") or fallback or item.get("text") or item.get("resolved_url") or "")
+            .strip()
+        )
+
+    @staticmethod
+    def _parse_last_run(value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _normalize_interval_days(value) -> int:
+        try:
+            days = int(float(value))
+        except (TypeError, ValueError):
+            return 0
+        return max(days, 0)
+
+    async def _load_account_subscriptions(self) -> list[dict]:
+        if self._subscription_lock is None:
+            return []
+        async with self._subscription_lock:
+            settings = self.parameter.settings.read() or {}
+            subs = settings.get("account_subscriptions") or []
+        if not isinstance(subs, list):
+            return []
+        return [dict(i) for i in subs if isinstance(i, dict)]
+
+    async def _apply_subscription_updates(self, updates: dict[str, dict]) -> None:
+        if not updates or self._subscription_lock is None:
+            return
+        async with self._subscription_lock:
+            settings = self.parameter.settings.read() or {}
+            subs = settings.get("account_subscriptions") or []
+            if not isinstance(subs, list):
+                subs = []
+            for item in subs:
+                if not isinstance(item, dict):
+                    continue
+                key = self._subscription_key(item)
+                if key in updates:
+                    item.update(updates[key])
+            settings["account_subscriptions"] = subs
+            self.parameter.settings.update(settings)
+
+    async def _save_account_subscription_from_extract(
+        self,
+        extract: DownloadAccount,
+        sec_user_id: str,
+        resolved_url: str,
+    ) -> None:
+        text = (extract.text or "").strip()
+        if not text:
+            return
+        interval_days = self._normalize_interval_days(extract.subscribe_interval_days)
+        enable_override = bool(extract.subscribe)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        if self._subscription_lock is None:
+            self._subscription_lock = asyncio.Lock()
+
+        async with self._subscription_lock:
+            settings = self.parameter.settings.read() or {}
+            subs = settings.get("account_subscriptions") or []
+            if not isinstance(subs, list):
+                subs = []
+            existing = None
+            for item in subs:
+                if not isinstance(item, dict):
+                    continue
+                if (sec_user_id and item.get("sec_user_id") == sec_user_id) or item.get("text") == text:
+                    existing = item
+                    break
+            if existing is None:
+                existing = {}
+                subs.append(existing)
+
+            existing.update(
+                {
+                    "text": text,
+                    "resolved_url": resolved_url or existing.get("resolved_url", ""),
+                    "sec_user_id": sec_user_id or existing.get("sec_user_id", ""),
+                    "mark": extract.mark,
+                    "tab": "post",
+                    "earliest": extract.earliest,
+                    "latest": extract.latest,
+                    "pages": extract.pages,
+                    "cursor": extract.cursor,
+                    "count": extract.count,
+                }
+            )
+            if extract.proxy:
+                existing["proxy"] = extract.proxy
+            if interval_days > 0:
+                existing["interval_days"] = interval_days
+            elif "interval_days" not in existing:
+                existing["interval_days"] = self.DEFAULT_SUBSCRIPTION_INTERVAL_DAYS
+            existing["enable"] = enable_override
+            existing["last_run"] = now_iso
+
+            settings["account_subscriptions"] = subs
+            self.parameter.settings.update(settings)
+
+    def _is_subscription_due(self, item: dict, now: datetime) -> bool:
+        if not item.get("enable", False):
+            return False
+        interval_days = self._normalize_interval_days(item.get("interval_days"))
+        if interval_days <= 0:
+            return False
+        last_run = self._parse_last_run(str(item.get("last_run", "")).strip())
+        if not last_run:
+            return True
+        return now - last_run >= timedelta(days=interval_days)
+
+    async def _subscription_loop(self):
+        self.logger.info("[Subscription] 账号订阅轮询已启动")
+        while self._subscription_stop and not self._subscription_stop.is_set():
+            try:
+                await self._run_due_account_subscriptions()
+            except Exception as e:
+                self.logger.error(f"[Subscription] 轮询异常: {e}")
+            try:
+                await asyncio.wait_for(
+                    self._subscription_stop.wait(),
+                    timeout=self.SUBSCRIPTION_POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                continue
+
+    async def _run_due_account_subscriptions(self) -> None:
+        subs = await self._load_account_subscriptions()
+        if not subs:
+            return
+        now = datetime.now()
+        updates: dict[str, dict] = {}
+        for item in subs:
+            if not isinstance(item, dict):
+                continue
+            if not self._is_subscription_due(item, now):
+                continue
+            ok, sec_user_id, resolved = await self._execute_account_subscription(item)
+            if not ok:
+                continue
+            key = self._subscription_key(item, sec_user_id)
+            if not key:
+                continue
+            updates[key] = {
+                "last_run": now.isoformat(timespec="seconds"),
+                "sec_user_id": sec_user_id or item.get("sec_user_id", ""),
+            }
+            if resolved:
+                updates[key]["resolved_url"] = resolved
+        if updates:
+            await self._apply_subscription_updates(updates)
+
+    async def _execute_account_subscription(
+        self,
+        item: dict,
+    ) -> tuple[bool, str, str]:
+        text = (item.get("text") or "").strip()
+        proxy = item.get("proxy") or None
+        resolved = ""
+        sec_user_id = ""
+
+        if text:
+            try:
+                resolved = await self.handle_redirect(text, proxy)
+            except Exception:
+                resolved = ""
+            ids = await self.links.run(text, "user", proxy)  # type: ignore[misc]
+            sec_user_id = ids[0] if ids else ""
+
+        if not sec_user_id:
+            sec_user_id = (item.get("sec_user_id") or "").strip()
+
+        if not sec_user_id:
+            self.logger.warning("[Subscription] 无法解析账号 sec_user_id，跳过订阅任务")
+            return False, "", resolved
+
+        info = await self.get_user_info_data(
+            False,
+            None,
+            proxy,
+            sec_user_id=sec_user_id,
+        )
+
+        pages = item.get("pages")
+        if pages is not None:
+            try:
+                pages = int(pages)
+            except (TypeError, ValueError):
+                pages = None
+        try:
+            cursor = int(item.get("cursor", 0) or 0)
+        except (TypeError, ValueError):
+            cursor = 0
+        try:
+            count = int(item.get("count", 18) or 18)
+        except (TypeError, ValueError):
+            count = 18
+
+        account_data, earliest, latest = await self._get_account_data(
+            cookie=None,
+            proxy=proxy,
+            sec_user_id=sec_user_id,
+            tab="post",
+            earliest=item.get("earliest", ""),
+            latest=item.get("latest", ""),
+            pages=pages,
+            cursor=cursor,
+            count=count,
+        )
+        if not any(account_data):
+            self.logger.warning("[Subscription] 获取账号发布作品数据失败")
+            return False, sec_user_id, resolved
+
+        data = await self._batch_process_detail(
+            account_data,
+            api=True,
+            tiktok=False,
+            info=info,
+            mode="post",
+            mark=item.get("mark", ""),
+            user_id=sec_user_id,
+            earliest=earliest,
+            latest=latest,
+        )
+        if not data:
+            self.logger.warning("[Subscription] 提取作品数据失败")
+            return False, sec_user_id, resolved
+
+        user_name = (info or {}).get("nickname", "")
+        folder_name = item.get("mark") or user_name
+        self.downloader.storage_folder("post", sec_user_id, folder_name)
+        await self.downloader.run_batch(
+            data,
+            False,
+            mode="post",
+            mark=item.get("mark", ""),
+            user_id=sec_user_id,
+            user_name=user_name,
+        )
+
+        self._trigger_post_download_hook(
+            {
+                "event": "download.completed",
+                "platform": "douyin",
+                "source": "account_subscription",
+                "resolved_url": resolved,
+                "root": str(self.parameter.root.resolve()),
+                "items": [],
+                "params": self._sanitize_hook_params(item),
+            }
+        )
+        return True, sec_user_id, resolved
 
     @staticmethod
     def _get_post_download_hook_urls() -> list[str]:
@@ -676,6 +965,13 @@ class APIServer(TikTok):
                     ),
                     data={"resolved_url": resolved, "items": []},
                     params=extract.model_dump(),
+                )
+
+            if extract.text:
+                await self._save_account_subscription_from_extract(
+                    extract,
+                    sec_user_id,
+                    resolved,
                 )
 
             # 获取账号信息（失败不一定致命：发布作品可能仍可抓取）

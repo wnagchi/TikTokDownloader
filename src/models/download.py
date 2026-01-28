@@ -59,6 +59,8 @@ class DownloadAccount(APIModel):
     pages: int | None = None
     cursor: int = 0
     count: int = Field(18, gt=0)
+    subscribe: bool = True
+    subscribe_interval_days: int = Field(0, ge=0)
 
 
 class DownloadAccountTikTok(DownloadAccount):
