@@ -168,6 +168,7 @@ class Account(API):
                 return self.generate_favorite_params()
             case False:
                 return self.generate_post_params()
+        return {}
 
     def generate_favorite_params(self) -> dict:
         return self.params | {
